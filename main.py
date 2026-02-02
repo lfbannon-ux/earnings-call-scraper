@@ -1,239 +1,194 @@
 #!/usr/bin/env python3
 """
-Seeking Alpha Scraper API - Railway Deployment
+Seeking Alpha Scraper - Main Entry Point
 
-FastAPI service that exposes the Seeking Alpha scraper as an API.
+Scrapes earnings call transcripts and emails results.
 
 Environment Variables:
-    SEEKING_ALPHA_SESSION_DIR: Path to store session data (default: /app/data/sa_session)
-    API_KEY: Optional API key for authentication
+    SMTP_USER: Email username (required)
+    SMTP_PASSWORD: Email app password (required)
+    EMAIL_TO: Recipient (default: lfbannon@gmail.com)
+    
+    SEEKING_ALPHA_SESSION_DIR: Session storage path
+    TICKERS: Comma-separated tickers to fetch (optional)
+    PAGES: Number of pages to scrape (default: 3)
+    
+Usage:
+    # With environment variables set
+    python main.py
+    
+    # Or with command line args
+    python main.py --tickers AAPL,MSFT,NVDA
+    python main.py --pages 5
+    python main.py --login  # First-time auth
 """
 
 import asyncio
+import argparse
 import os
-from contextlib import asynccontextmanager
+import sys
 from datetime import datetime
-from pathlib import Path
-from typing import Optional
-
-from fastapi import FastAPI, HTTPException, Depends, Header
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
 
 from seeking_alpha_authenticated import SeekingAlphaAPI
+from email_sender import EmailSender, send_transcript_email
 
 
-# =============================================================================
-# Configuration
-# =============================================================================
-
-SESSION_DIR = Path(os.environ.get('SEEKING_ALPHA_SESSION_DIR', '/app/data/sa_session'))
-API_KEY = os.environ.get('API_KEY')
-
-# Global scraper instance
-scraper: Optional[SeekingAlphaAPI] = None
-
-
-# =============================================================================
-# Models
-# =============================================================================
-
-class TranscriptRequest(BaseModel):
-    ticker: str
-
-class BatchRequest(BaseModel):
-    tickers: list[str]
-
-class HealthResponse(BaseModel):
-    status: str
-    authenticated: bool
-    session_dir: str
-    timestamp: str
-
-
-# =============================================================================
-# Auth
-# =============================================================================
-
-async def verify_api_key(x_api_key: Optional[str] = Header(None)):
-    if API_KEY and x_api_key != API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid API key")
-    return True
-
-
-# =============================================================================
-# Lifespan
-# =============================================================================
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global scraper
+async def run_scraper(tickers: list[str] = None, pages: int = 3) -> list[dict]:
+    """Run the scraper and return transcripts."""
     
-    # Startup
-    print(f"Starting Seeking Alpha scraper...")
-    print(f"Session directory: {SESSION_DIR}")
+    session_dir = os.environ.get('SEEKING_ALPHA_SESSION_DIR')
     
-    SESSION_DIR.mkdir(parents=True, exist_ok=True)
-    
-    scraper = SeekingAlphaAPI(
-        session_dir=SESSION_DIR,
+    api = SeekingAlphaAPI(
+        session_dir=session_dir,
         headless=True,
         verbose=True
     )
-    await scraper.start()
     
-    if scraper.is_authenticated:
-        print("✓ Session restored - authenticated")
-    else:
-        print("⚠ No valid session - run /login endpoint to authenticate")
+    try:
+        await api.start()
+        
+        if not api.is_authenticated:
+            print("⚠ Not authenticated - will only get preview content")
+            print("  Run with --login to authenticate with Google")
+        
+        if tickers:
+            print(f"Fetching transcripts for: {', '.join(tickers)}")
+            results = []
+            for ticker in tickers:
+                print(f"  → {ticker}...")
+                transcript = await api.get_transcript(ticker)
+                if transcript:
+                    results.append(transcript)
+                    print(f"    ✓ Found: {transcript.get('title', 'No title')[:50]}...")
+                else:
+                    print(f"    ✗ No transcript found")
+            return results
+        else:
+            print(f"Fetching latest transcripts ({pages} pages)...")
+            return await api.get_latest_transcripts(max_pages=pages)
+            
+    finally:
+        await api.close()
+
+
+async def do_login():
+    """Interactive login flow."""
+    print("\n" + "=" * 60)
+    print("GOOGLE LOGIN")
+    print("=" * 60)
     
-    yield
+    session_dir = os.environ.get('SEEKING_ALPHA_SESSION_DIR')
     
-    # Shutdown
-    if scraper:
-        await scraper.close()
-        print("Scraper closed")
-
-
-# =============================================================================
-# App
-# =============================================================================
-
-app = FastAPI(
-    title="Seeking Alpha Scraper API",
-    description="API for fetching earnings call transcripts from Seeking Alpha",
-    version="1.0.0",
-    lifespan=lifespan
-)
-
-
-@app.get("/health", response_model=HealthResponse)
-async def health():
-    """Health check endpoint."""
-    return HealthResponse(
-        status="ok",
-        authenticated=scraper.is_authenticated if scraper else False,
-        session_dir=str(SESSION_DIR),
-        timestamp=datetime.now().isoformat()
+    api = SeekingAlphaAPI(
+        session_dir=session_dir,
+        headless=False,  # Need visible browser for OAuth
+        verbose=True
     )
-
-
-@app.get("/latest")
-async def get_latest(
-    pages: int = 3,
-    _: bool = Depends(verify_api_key)
-):
-    """Get latest earnings call transcript listings."""
-    if not scraper:
-        raise HTTPException(status_code=503, detail="Scraper not initialized")
     
     try:
-        transcripts = await scraper.get_latest_transcripts(max_pages=pages)
-        return {
-            "count": len(transcripts),
-            "transcripts": transcripts,
-            "scraped_at": datetime.now().isoformat()
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        await api.start(force_login=True)
+        success = await api.login_with_google()
+        
+        if success:
+            print("\n✓ Login successful! Session saved.")
+            print("  Run again without --login to scrape.")
+        else:
+            print("\n✗ Login failed or timed out.")
+            sys.exit(1)
+    finally:
+        await api.close()
 
 
-@app.get("/transcript/{ticker}")
-async def get_transcript(
-    ticker: str,
-    _: bool = Depends(verify_api_key)
-):
-    """Get full transcript for a specific ticker."""
-    if not scraper:
-        raise HTTPException(status_code=503, detail="Scraper not initialized")
+async def main():
+    parser = argparse.ArgumentParser(description='Seeking Alpha Scraper')
+    parser.add_argument('--login', action='store_true', help='Authenticate with Google')
+    parser.add_argument('--tickers', type=str, help='Comma-separated tickers (or set TICKERS env var)')
+    parser.add_argument('--pages', type=int, help='Pages to scrape (or set PAGES env var)')
+    parser.add_argument('--dry-run', action='store_true', help='Skip email, just print results')
     
+    args = parser.parse_args()
+    
+    print("\n" + "=" * 60)
+    print("SEEKING ALPHA SCRAPER")
+    print(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("=" * 60)
+    
+    # Handle login
+    if args.login:
+        await do_login()
+        return
+    
+    # Check email config
+    email_sender = EmailSender()
+    if not email_sender.is_configured():
+        print("\n⚠ EMAIL NOT CONFIGURED")
+        print("  Set SMTP_USER and SMTP_PASSWORD environment variables")
+        print("  For Gmail, use an App Password from:")
+        print("  https://myaccount.google.com/apppasswords")
+        if not args.dry_run:
+            print("\nContinuing in dry-run mode...\n")
+            args.dry_run = True
+    else:
+        print(f"Email: {email_sender.smtp_user} → {email_sender.email_to}")
+    
+    # Get tickers from args or env
+    tickers = None
+    if args.tickers:
+        tickers = [t.strip().upper() for t in args.tickers.split(',')]
+    elif os.environ.get('TICKERS'):
+        tickers = [t.strip().upper() for t in os.environ['TICKERS'].split(',')]
+    
+    # Get pages from args or env
+    pages = args.pages or int(os.environ.get('PAGES', '3'))
+    
+    # Run scraper
+    print()
     try:
-        transcript = await scraper.get_transcript(ticker.upper())
-        if not transcript:
-            raise HTTPException(status_code=404, detail=f"No transcript found for {ticker}")
-        return transcript
-    except HTTPException:
-        raise
+        transcripts = await run_scraper(tickers=tickers, pages=pages)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/batch")
-async def batch_transcripts(
-    request: BatchRequest,
-    _: bool = Depends(verify_api_key)
-):
-    """Fetch transcripts for multiple tickers."""
-    if not scraper:
-        raise HTTPException(status_code=503, detail="Scraper not initialized")
+        print(f"\n✗ Scraper error: {e}")
+        print("  Try running with --login first")
+        sys.exit(1)
     
-    try:
-        results = await scraper.get_transcripts_for_tickers(
-            [t.upper() for t in request.tickers]
-        )
-        return {
-            "count": len(results),
-            "transcripts": results,
-            "scraped_at": datetime.now().isoformat()
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/search/{ticker}")
-async def search_transcript(
-    ticker: str,
-    _: bool = Depends(verify_api_key)
-):
-    """Search for transcript metadata by ticker."""
-    if not scraper:
-        raise HTTPException(status_code=503, detail="Scraper not initialized")
+    # Results summary
+    print(f"\n{'=' * 60}")
+    print(f"RESULTS: {len(transcripts)} transcripts")
+    print("=" * 60)
     
-    try:
-        result = await scraper.search_transcript(ticker.upper())
-        if not result:
-            raise HTTPException(status_code=404, detail=f"No transcript found for {ticker}")
-        return result
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/status")
-async def auth_status():
-    """Check authentication status."""
-    return {
-        "authenticated": scraper.is_authenticated if scraper else False,
-        "session_file_exists": (SESSION_DIR / "auth_state.json").exists(),
-        "message": "Ready" if (scraper and scraper.is_authenticated) else "Login required - see /login"
-    }
-
-
-@app.post("/login")
-async def trigger_login():
-    """
-    Trigger Google login flow.
+    if not transcripts:
+        print("No transcripts found.")
+        return
     
-    Note: This requires manual interaction in a browser.
-    For Railway deployment, run locally first to generate session,
-    then copy the session file to Railway's persistent storage.
-    """
-    return {
-        "message": "Google login requires browser interaction",
-        "instructions": [
-            "1. Run locally: python seeking_alpha_authenticated.py --login",
-            "2. Complete Google sign-in in the browser",
-            "3. Copy ~/.seeking_alpha_session/auth_state.json to Railway volume",
-            "4. Restart the Railway service"
-        ]
-    }
+    for t in transcripts:
+        ticker = t.get('ticker', 'N/A')
+        date = t.get('date', '')[:10] if t.get('date') else 'N/A'
+        title = t.get('title', 'No title')[:55]
+        paywalled = " [PAYWALLED]" if t.get('is_paywalled') else ""
+        print(f"  {ticker:6} | {date} | {title}...{paywalled}")
+    
+    # Send email
+    if args.dry_run:
+        print("\n[Dry run - skipping email]")
+    else:
+        print(f"\n{'=' * 60}")
+        print("SENDING EMAIL")
+        print("=" * 60)
+        
+        date_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+        subject = f"Seeking Alpha Transcripts - {date_str}"
+        
+        success = send_transcript_email(transcripts, subject=subject)
+        
+        if success:
+            print("✓ Email sent!")
+        else:
+            print("✗ Failed to send email")
+            sys.exit(1)
+    
+    print(f"\n{'=' * 60}")
+    print("DONE")
+    print("=" * 60 + "\n")
 
-
-# =============================================================================
-# Run directly
-# =============================================================================
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+    asyncio.run(main())
