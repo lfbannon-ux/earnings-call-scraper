@@ -9,17 +9,17 @@ Environment Variables:
     FACTSET_API_KEY: FactSet API Key
     SMTP_USER: Email username
     SMTP_PASSWORD: Email app password
-    EMAIL_TO: Recipient (default: lfbannon@gmail.com)
+    EMAIL_TO: Recipient
     TICKERS: Comma-separated tickers to fetch
 """
 
 import argparse
-import base64
 import os
 import sys
 from datetime import datetime, timedelta
 from typing import Optional
 import requests
+from requests.auth import HTTPBasicAuth
 
 from email_sender import EmailSender, send_transcript_email
 
@@ -27,7 +27,6 @@ from email_sender import EmailSender, send_transcript_email
 class FactSetAPI:
     """FactSet Events and Transcripts API client."""
     
-    # Correct base URL
     BASE_URL = "https://api.factset.com/content/events/v2"
     
     def __init__(
@@ -43,11 +42,8 @@ class FactSetAPI:
         if not self.username or not self.api_key:
             raise ValueError("FACTSET_USERNAME and FACTSET_API_KEY required")
         
-        # Create auth header
-        credentials = f"{self.username}:{self.api_key}"
-        encoded = base64.b64encode(credentials.encode()).decode()
+        self.auth = HTTPBasicAuth(self.username, self.api_key)
         self.headers = {
-            "Authorization": f"Basic {encoded}",
             "Content-Type": "application/json",
             "Accept": "application/json"
         }
@@ -56,18 +52,22 @@ class FactSetAPI:
         if self.verbose:
             print(message)
     
-    def _make_request(self, method: str, endpoint: str, **kwargs) -> Optional[requests.Response]:
+    def _make_request(self, method: str, endpoint: str, json_data=None, params=None) -> Optional[requests.Response]:
         """Make API request with error handling."""
         url = f"{self.BASE_URL}{endpoint}"
         self._log(f"  Request: {method} {url}")
+        if json_data:
+            self._log(f"  Payload: {json_data}")
         
         try:
             response = requests.request(
                 method,
                 url,
+                auth=self.auth,
                 headers=self.headers,
-                timeout=30,
-                **kwargs
+                json=json_data,
+                params=params,
+                timeout=30
             )
             self._log(f"  Status: {response.status_code}")
             return response
@@ -75,85 +75,35 @@ class FactSetAPI:
             self._log(f"  Error: {e}")
             return None
 
-    def get_categories(self) -> list[dict]:
-        """Get available transcript categories - useful for testing connection."""
-        self._log("Getting categories (connection test)...")
-        
-        response = self._make_request("GET", "/transcripts/categories")
-        
-        if response and response.status_code == 200:
-            data = response.json()
-            categories = data.get('data', [])
-            self._log(f"  ✓ Found {len(categories)} categories")
-            return categories
-        elif response:
-            self._log(f"  Response: {response.text[:300]}")
-        
-        return []
-
-    def search_transcripts(
-        self,
-        tickers: list[str] = None,
-        days_back: int = 90
-    ) -> list[dict]:
-        """Search for transcripts by ticker or date range."""
-        
-        end_date = datetime.now()
-        start_date = end_date - timedelta(days=days_back)
-        
-        # Build request payload per FactSet API spec
-        payload = {
-            "data": {
-                "startDate": start_date.strftime("%Y-%m-%d"),
-                "endDate": end_date.strftime("%Y-%m-%d"),
-                "eventTypes": ["EarningsCall"]
-            }
-        }
-        
-        if tickers:
-            payload["data"]["ids"] = tickers
-        
-        self._log(f"Searching transcripts...")
-        if tickers:
-            self._log(f"  Tickers: {', '.join(tickers)}")
-        self._log(f"  Date range: {payload['data']['startDate']} to {payload['data']['endDate']}")
-        
-        response = self._make_request("POST", "/transcripts/search", json=payload)
-        
-        if response and response.status_code == 200:
-            data = response.json()
-            transcripts = data.get('data', [])
-            self._log(f"  ✓ Found {len(transcripts)} transcripts")
-            return transcripts
-        elif response:
-            self._log(f"  Response: {response.text[:500]}")
-        
-        return []
-    
     def get_company_events(
         self,
-        tickers: list[str] = None,
-        days_back: int = 30,
+        tickers: list[str],
+        days_back: int = 90,
         days_forward: int = 30
     ) -> list[dict]:
-        """Get earnings calendar events."""
+        """Get earnings calendar events - matches exact API format."""
         
         end_date = datetime.now() + timedelta(days=days_forward)
         start_date = datetime.now() - timedelta(days=days_back)
         
+        # Exact format from FactSet documentation
         payload = {
             "data": {
-                "startDate": start_date.strftime("%Y-%m-%d"),
-                "endDate": end_date.strftime("%Y-%m-%d"),
+                "dateTime": {
+                    "start": start_date.strftime("%Y-%m-%dT00:00:00Z"),
+                    "end": end_date.strftime("%Y-%m-%dT23:59:59Z")
+                },
+                "universe": {
+                    "symbols": tickers,
+                    "type": "Tickers"
+                },
+                "eventTypes": ["Earnings"]
             }
         }
         
-        if tickers:
-            payload["data"]["ids"] = tickers
-        
         self._log(f"Fetching company events...")
         
-        response = self._make_request("POST", "/calendar/events", json=payload)
+        response = self._make_request("POST", "/calendar/events", json_data=payload)
         
         if response and response.status_code == 200:
             data = response.json()
@@ -165,15 +115,91 @@ class FactSetAPI:
         
         return []
 
-    def get_transcript_content(self, report_id: str) -> Optional[str]:
-        """Download transcript XML content."""
+    def search_transcripts_by_ids(self, tickers: list[str]) -> list[dict]:
+        """Search transcripts by ticker IDs - exact format from documentation."""
         
-        self._log(f"  Fetching transcript content for {report_id}...")
+        # Exact format: TranscriptsByIdsRequest
+        payload = {
+            "data": {
+                "primaryId": False,
+                "ids": tickers
+            },
+            "meta": {
+                "pagination": {
+                    "limit": 25,
+                    "offset": 0
+                },
+                "sort": ["-storyDateTime"]
+            }
+        }
         
-        response = self._make_request("GET", f"/transcripts/{report_id}")
+        self._log(f"Searching transcripts by IDs...")
+        
+        response = self._make_request("POST", "/transcripts", json_data=payload)
         
         if response and response.status_code == 200:
-            return response.text
+            data = response.json()
+            transcripts = data.get('data', [])
+            self._log(f"  ✓ Found {len(transcripts)} transcript groups")
+            return transcripts
+        elif response:
+            self._log(f"  Response: {response.text[:500]}")
+        
+        return []
+
+    def search_transcripts_by_date(self, days_back: int = 30) -> list[dict]:
+        """Search transcripts by date range - exact format from documentation."""
+        
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=days_back)
+        
+        # Exact format: TranscriptsByDateRequest
+        payload = {
+            "data": {
+                "startDate": start_date.strftime("%Y-%m-%d"),
+                "endDate": end_date.strftime("%Y-%m-%d"),
+                "timeZone": "America/New_York"
+            },
+            "meta": {
+                "pagination": {
+                    "limit": 25,
+                    "offset": 0
+                },
+                "sort": ["-storyDateTime"]
+            }
+        }
+        
+        self._log(f"Searching transcripts by date...")
+        
+        response = self._make_request("POST", "/transcripts", json_data=payload)
+        
+        if response and response.status_code == 200:
+            data = response.json()
+            transcripts = data.get('data', [])
+            self._log(f"  ✓ Found {len(transcripts)} transcripts")
+            return transcripts
+        elif response:
+            self._log(f"  Response: {response.text[:500]}")
+        
+        return []
+
+    def get_transcript_content(self, transcripts_url: str) -> Optional[str]:
+        """Download transcript XML content."""
+        
+        self._log(f"  Downloading transcript...")
+        
+        try:
+            response = requests.get(
+                transcripts_url,
+                auth=self.auth,
+                timeout=30
+            )
+            if response.status_code == 200:
+                return response.text
+            else:
+                self._log(f"    Failed: {response.status_code}")
+        except Exception as e:
+            self._log(f"    Error: {e}")
         
         return None
 
@@ -182,31 +208,55 @@ class FactSetAPI:
         
         results = []
         
-        # Try transcript search first
-        transcripts = self.search_transcripts(tickers=tickers)
+        # Try transcript search by IDs first
+        self._log(f"\nSearching transcripts for: {', '.join(tickers)}")
+        transcripts = self.search_transcripts_by_ids(tickers)
         
         if transcripts:
-            for t in transcripts[:20]:
-                result = {
-                    'ticker': t.get('primaryIds', [''])[0] if t.get('primaryIds') else t.get('ticker', ''),
-                    'title': t.get('title', t.get('eventTitle', 'Earnings Call')),
-                    'date': t.get('eventDateTime', t.get('transcriptDateTime', '')),
-                    'report_id': t.get('reportId', t.get('report_id', '')),
-                    'url': t.get('transcriptsUrl', t.get('transcripts_url', '')),
-                }
-                results.append(result)
-            return results
+            # Response format per docs: nested documents array
+            for entry in transcripts:
+                if 'documents' in entry:
+                    # TranscriptsByIdsResponse format
+                    for doc in entry.get('documents', []):
+                        result = {
+                            'ticker': doc.get('primaryIds', [''])[0] if doc.get('primaryIds') else '',
+                            'title': doc.get('headline', 'Earnings Call'),
+                            'date': doc.get('storyDateTime', ''),
+                            'report_id': doc.get('reportId', doc.get('report_id', '')),
+                            'url': doc.get('transcriptsUrl', doc.get('transcripts_url', '')),
+                            'event_type': doc.get('eventType', ''),
+                            'transcript_type': doc.get('transcriptType', ''),
+                        }
+                        results.append(result)
+                else:
+                    # Direct transcript response format
+                    result = {
+                        'ticker': entry.get('primaryIds', [''])[0] if entry.get('primaryIds') else '',
+                        'title': entry.get('headline', 'Earnings Call'),
+                        'date': entry.get('storyDateTime', ''),
+                        'report_id': entry.get('reportId', entry.get('report_id', '')),
+                        'url': entry.get('transcriptsUrl', entry.get('transcripts_url', '')),
+                        'event_type': entry.get('eventType', ''),
+                        'transcript_type': entry.get('transcriptType', ''),
+                    }
+                    results.append(result)
+            
+            if results:
+                return results
         
         # Fallback to calendar events
-        self._log("No transcripts found, trying calendar events...")
-        events = self.get_company_events(tickers=tickers)
+        self._log("\nNo transcripts found, trying calendar events...")
+        events = self.get_company_events(tickers)
         
         for event in events:
             result = {
-                'ticker': event.get('ticker', ''),
-                'title': event.get('eventTitle', event.get('title', 'Earnings Event')),
-                'date': event.get('eventDateTime', event.get('startDateTime', '')),
-                'type': event.get('eventType', ''),
+                'ticker': event.get('identifier', ''),
+                'title': event.get('description', 'Earnings Event'),
+                'date': event.get('eventDateTime', ''),
+                'entity_name': event.get('entityName', ''),
+                'event_type': event.get('eventType', ''),
+                'event_id': event.get('eventId', ''),
+                'report_id': event.get('reportId', ''),
             }
             if result['ticker'] or result['title']:
                 results.append(result)
@@ -218,25 +268,29 @@ class FactSetAPI:
         
         self._log("Testing FactSet API connection...")
         self._log(f"  Username: {self.username}")
-        self._log(f"  Base URL: {self.BASE_URL}")
         
-        # Try categories endpoint (simple GET)
-        categories = self.get_categories()
-        if categories:
+        # Try /meta/categories (simple GET)
+        response = self._make_request("GET", "/meta/categories")
+        
+        if response and response.status_code == 200:
+            self._log("  ✓ /meta/categories works!")
             return True
         
-        # Try a simple search
-        self._log("\nTrying transcript search...")
-        transcripts = self.search_transcripts(tickers=["AAPL-US"], days_back=30)
+        # Try calendar events with AAPL
+        self._log("\nTrying calendar events with AAPL-US...")
+        events = self.get_company_events(["AAPL-US"])
+        if events:
+            self._log("  ✓ Calendar events work!")
+            return True
+        
+        # Try transcripts by date
+        self._log("\nTrying transcripts by date...")
+        transcripts = self.search_transcripts_by_date(days_back=7)
         if transcripts:
+            self._log("  ✓ Transcripts work!")
             return True
         
         self._log("\n✗ Could not connect to FactSet API")
-        self._log("  Possible issues:")
-        self._log("  - API credentials may be incorrect")
-        self._log("  - Account may not have Events & Transcripts API entitlement")
-        self._log("  - Contact FactSet support to verify API access")
-        
         return False
 
 
@@ -296,7 +350,7 @@ def main():
         print("  Example: --tickers AAPL-US,MSFT-US,AUB-AU")
         sys.exit(1)
     
-    print(f"\nFetching transcripts for: {', '.join(tickers)}")
+    print(f"\nFetching data for: {', '.join(tickers)}")
     transcripts = api.get_transcripts_for_tickers(tickers)
     
     # Results
@@ -313,9 +367,9 @@ def main():
         return
     
     for t in transcripts:
-        ticker = t.get('ticker', 'N/A')
+        ticker = t.get('ticker', t.get('identifier', 'N/A'))
         date = str(t.get('date', ''))[:10] if t.get('date') else 'N/A'
-        title = t.get('title', 'No title')[:50]
+        title = t.get('title', t.get('description', 'No title'))[:50]
         print(f"  {ticker:12} | {date} | {title}...")
     
     # Send email
