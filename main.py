@@ -74,11 +74,26 @@ log = logging.getLogger(__name__)
 # PLAYWRIGHT — STEALTH BROWSER WITH SA COOKIES
 # ---------------------------------------------------------------------------
 
+# Global references kept alive outside context manager
+_pw_instance = None
+_browser_instance = None
+
 async def create_browser_context():
-    """Launch Playwright browser with SA cookies injected."""
+    """Launch stealth Playwright browser with SA cookies injected."""
+    global _pw_instance, _browser_instance
     from playwright.async_api import async_playwright
 
-    pw = await async_playwright().start()
+    try:
+        from playwright_stealth import Stealth
+        stealth = Stealth()
+        # use_async wraps async_playwright() — must be used as context manager
+        _pw_instance = stealth.use_async(async_playwright())
+        pw = await _pw_instance.__aenter__()
+        log.info("  Stealth mode: playwright_stealth active")
+    except Exception as e:
+        log.warning(f"  Stealth import failed ({e}), using manual evasions")
+        _pw_instance = async_playwright()
+        pw = await _pw_instance.__aenter__()
 
     browser = await pw.chromium.launch(
         headless=True,
@@ -89,6 +104,7 @@ async def create_browser_context():
             "--disable-gpu",
         ],
     )
+    _browser_instance = browser
 
     context = await browser.new_context(
         viewport={"width": 1920, "height": 1080},
@@ -100,6 +116,23 @@ async def create_browser_context():
         locale="en-US",
         timezone_id="America/New_York",
     )
+
+    # Extra manual evasions on top of stealth plugin
+    await context.add_init_script("""
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+        if (!window.chrome) { window.chrome = { runtime: {} }; }
+        Object.defineProperty(navigator, 'plugins', {
+            get: () => [1, 2, 3, 4, 5]
+        });
+        Object.defineProperty(navigator, 'languages', {
+            get: () => ['en-US', 'en']
+        });
+        const originalQuery = window.navigator.permissions.query;
+        window.navigator.permissions.query = (parameters) =>
+            parameters.name === 'notifications'
+                ? Promise.resolve({ state: Notification.permission })
+                : originalQuery(parameters);
+    """)
 
     # Inject SA cookies
     cookies_to_add = []
@@ -121,7 +154,19 @@ async def create_browser_context():
     else:
         log.warning("  No SA cookies — will only get preview content")
 
-    return pw, browser, context
+    return _pw_instance, browser, context
+
+
+async def cleanup_browser(pw_ref, browser):
+    """Clean up browser and playwright."""
+    try:
+        await browser.close()
+    except Exception:
+        pass
+    try:
+        await pw_ref.__aexit__(None, None, None)
+    except Exception:
+        pass
 
 
 async def human_delay(min_s=2, max_s=5):
@@ -134,41 +179,6 @@ async def scroll_page(page):
         await asyncio.sleep(random.uniform(0.5, 1.5))
 
 
-_stealth_applied = False
-
-async def new_stealth_page(context):
-    """Create a new page with stealth patches applied."""
-    global _stealth_applied
-    
-    if not _stealth_applied:
-        try:
-            from playwright_stealth import Stealth
-            stealth = Stealth(init_scripts_only=True)
-            # Apply stealth init scripts to the context
-            for script in stealth.init_scripts:
-                await context.add_init_script(script)
-            _stealth_applied = True
-            log.info("  Stealth scripts applied via Stealth class")
-        except Exception as e1:
-            try:
-                from playwright_stealth import stealth_async
-                # Will apply per-page below
-                pass
-            except ImportError:
-                log.warning(f"  Stealth not available, using manual evasions: {e1}")
-                # Manual anti-detection
-                await context.add_init_script("""
-                    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                    Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-                    Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-                    window.chrome = { runtime: {} };
-                """)
-                _stealth_applied = True
-    
-    page = await context.new_page()
-    return page
-
-
 # ---------------------------------------------------------------------------
 # SCRAPE SA — TRANSCRIPT LISTING
 # ---------------------------------------------------------------------------
@@ -178,7 +188,7 @@ async def get_transcript_links(context, ticker, sa_slug):
     url = f"https://seekingalpha.com/symbol/{sa_slug}/earnings/transcripts"
     log.info(f"  Listing: {url}")
 
-    page = await new_stealth_page(context)
+    page = await context.new_page()
     try:
         await human_delay(1, 3)
         resp = await page.goto(url, wait_until="domcontentloaded", timeout=30000)
@@ -224,7 +234,7 @@ async def get_transcript_content(context, url, title):
     fetch_url = url + "?part=single" if "?" not in url else url
     log.info(f"  Fetching: {fetch_url[:80]}...")
 
-    page = await new_stealth_page(context)
+    page = await context.new_page()
     try:
         await human_delay(3, 7)
         await page.set_extra_http_headers({"Referer": "https://www.google.com/"})
@@ -313,8 +323,7 @@ async def scrape_all_transcripts(tickers_to_scan):
                     })
                     break
     finally:
-        await browser.close()
-        await pw.stop()
+        await cleanup_browser(pw, browser)
 
     return transcripts
 
