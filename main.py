@@ -134,11 +134,38 @@ async def scroll_page(page):
         await asyncio.sleep(random.uniform(0.5, 1.5))
 
 
+_stealth_applied = False
+
 async def new_stealth_page(context):
     """Create a new page with stealth patches applied."""
-    from playwright_stealth import stealth_async
+    global _stealth_applied
+    
+    if not _stealth_applied:
+        try:
+            from playwright_stealth import Stealth
+            stealth = Stealth(init_scripts_only=True)
+            # Apply stealth init scripts to the context
+            for script in stealth.init_scripts:
+                await context.add_init_script(script)
+            _stealth_applied = True
+            log.info("  Stealth scripts applied via Stealth class")
+        except Exception as e1:
+            try:
+                from playwright_stealth import stealth_async
+                # Will apply per-page below
+                pass
+            except ImportError:
+                log.warning(f"  Stealth not available, using manual evasions: {e1}")
+                # Manual anti-detection
+                await context.add_init_script("""
+                    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                    Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+                    Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+                    window.chrome = { runtime: {} };
+                """)
+                _stealth_applied = True
+    
     page = await context.new_page()
-    await stealth_async(page)
     return page
 
 
