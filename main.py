@@ -75,14 +75,12 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 async def create_browser_context():
-    """Launch stealth Playwright browser with SA cookies injected."""
+    """Launch Playwright browser with SA cookies injected."""
     from playwright.async_api import async_playwright
-    from playwright_stealth import Stealth
 
-    stealth = Stealth()
     pw = await async_playwright().start()
 
-    browser = await stealth.use_async(pw).chromium.launch(
+    browser = await pw.chromium.launch(
         headless=True,
         args=[
             "--disable-blink-features=AutomationControlled",
@@ -136,6 +134,14 @@ async def scroll_page(page):
         await asyncio.sleep(random.uniform(0.5, 1.5))
 
 
+async def new_stealth_page(context):
+    """Create a new page with stealth patches applied."""
+    from playwright_stealth import stealth_async
+    page = await context.new_page()
+    await stealth_async(page)
+    return page
+
+
 # ---------------------------------------------------------------------------
 # SCRAPE SA — TRANSCRIPT LISTING
 # ---------------------------------------------------------------------------
@@ -145,7 +151,7 @@ async def get_transcript_links(context, ticker, sa_slug):
     url = f"https://seekingalpha.com/symbol/{sa_slug}/earnings/transcripts"
     log.info(f"  Listing: {url}")
 
-    page = await context.new_page()
+    page = await new_stealth_page(context)
     try:
         await human_delay(1, 3)
         resp = await page.goto(url, wait_until="domcontentloaded", timeout=30000)
@@ -191,7 +197,7 @@ async def get_transcript_content(context, url, title):
     fetch_url = url + "?part=single" if "?" not in url else url
     log.info(f"  Fetching: {fetch_url[:80]}...")
 
-    page = await context.new_page()
+    page = await new_stealth_page(context)
     try:
         await human_delay(3, 7)
         await page.set_extra_http_headers({"Referer": "https://www.google.com/"})
