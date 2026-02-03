@@ -1,385 +1,496 @@
 #!/usr/bin/env python3
 """
-AUB Group Peer Earnings Monitor — Seeking Alpha Edition
-Uses Playwright + stealth to scrape SA earnings transcripts,
-Claude API to analyse for AUB-relevant signals, emails summary.
+AUB Peer Earnings Monitor — Seeking Alpha JSON API approach.
 
-Deploy on Railway as a cron job.
+Uses SA's internal JSON API endpoints (same ones their frontend calls)
+with authenticated session cookies. No browser/Playwright needed.
 """
 
 import os
-import sys
 import re
 import json
 import time
 import random
-import asyncio
-import smtplib
 import logging
+import smtplib
 from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
-from bs4 import BeautifulSoup
 import requests
+from bs4 import BeautifulSoup
+
+# ---------------------------------------------------------------------------
+# LOGGING
+# ---------------------------------------------------------------------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)-5s  %(message)s")
+log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # CONFIG
 # ---------------------------------------------------------------------------
-
-FOCUS_COMPANY = "AUB Group (ASX: AUB)"
-FOCUS_DESCRIPTION = """AUB Group is an Australasian insurance broker network.
-Key exposures: Business/ISR/Strata/Farm (property ~45-50% of book),
-Liability/WC/Motor/PI (casualty ~27%), with CGU/IAG (43%), Lloyd's (16%),
-Allianz (12%), QBE (8%) as key panel insurers."""
-
-PEERS = {
-    "AJG":   {"name": "Arthur J. Gallagher & Co.",  "sa_slug": "AJG"},
-    "BRO":   {"name": "Brown & Brown, Inc.",         "sa_slug": "BRO"},
-    "MMC":   {"name": "Marsh McLennan Companies",    "sa_slug": "MMC"},
-    "AON":   {"name": "Aon plc",                     "sa_slug": "AON"},
-    "AUBBF": {"name": "AUB Group (OTC)",             "sa_slug": "AUBBF"},
-    "SFGLF": {"name": "Steadfast Group (OTC)",       "sa_slug": "SFGLF"},
-}
-
-LOOKBACK_DAYS = int(os.environ.get("LOOKBACK_DAYS", "21"))
-
-# Email
-SMTP_USER     = os.environ.get("SMTP_USER", "")
+SMTP_USER = os.environ.get("SMTP_USER", "")
 SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
-EMAIL_TO      = os.environ.get("EMAIL_TO", "lfbannon@gmail.com")
-SMTP_HOST     = os.environ.get("SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT     = int(os.environ.get("SMTP_PORT", "587"))
+EMAIL_TO = os.environ.get("EMAIL_TO", SMTP_USER)
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+LOOKBACK_DAYS = int(os.environ.get("LOOKBACK_DAYS", "21"))
+TICKERS_RAW = os.environ.get("TICKERS", "AJG,BRO,MMC,AON,AUBBF,SFGLF")
 
-# SA cookies from your browser
+# SA cookie values from env
 SA_COOKIES = {
-    "session_id":          os.environ.get("SA_SESSION_ID", ""),
-    "user_id":             os.environ.get("SA_USER_ID", ""),
+    "_sasource":        "unknown",
+    "session_id":       os.environ.get("SA_SESSION_ID", ""),
+    "user_id":          os.environ.get("SA_USER_ID", ""),
     "user_remember_token": os.environ.get("SA_REMEMBER_TOKEN", ""),
-    "machine_cookie":      os.environ.get("SA_MACHINE_COOKIE", ""),
-    "user_cookie_key":     os.environ.get("SA_COOKIE_KEY", ""),
-    "sapu":                os.environ.get("SA_SAPU", ""),
+    "machine_cookie":   os.environ.get("SA_MACHINE_COOKIE", ""),
+    "_sp_ses.1cf2":     "*",
+    "sapu":             os.environ.get("SA_SAPU", "12"),
+    "gk_user_access":   "1",
+    "gk_user_access_unpaid": "1",
 }
 
-# Claude API
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+# Add the cookie key if provided
+SA_COOKIE_KEY = os.environ.get("SA_COOKIE_KEY", "")
+if SA_COOKIE_KEY:
+    SA_COOKIES[SA_COOKIE_KEY] = "1"
 
-# Tickers override
-TICKERS_ENV = os.environ.get("TICKERS", "")
+# Ticker -> full name and SA slug mapping
+TICKER_INFO = {
+    "AJG":   {"name": "Arthur J. Gallagher & Co.", "sa_slug": "ajg"},
+    "BRO":   {"name": "Brown & Brown, Inc.", "sa_slug": "bro"},
+    "MMC":   {"name": "Marsh McLennan Companies", "sa_slug": "mmc"},
+    "AON":   {"name": "Aon plc", "sa_slug": "aon"},
+    "AUBBF": {"name": "AUB Group (OTC)", "sa_slug": "aubbf"},
+    "SFGLF": {"name": "Steadfast Group (OTC)", "sa_slug": "sfglf"},
+    "WTW":   {"name": "Willis Towers Watson", "sa_slug": "wtw"},
+}
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s")
-log = logging.getLogger(__name__)
+TICKERS = [t.strip().upper() for t in TICKERS_RAW.split(",") if t.strip()]
+CUTOFF = datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)
 
 # ---------------------------------------------------------------------------
-# PLAYWRIGHT — STEALTH BROWSER WITH SA COOKIES
+# HTTP SESSION SETUP
 # ---------------------------------------------------------------------------
 
-# Global references kept alive outside context manager
-_pw_instance = None
-_browser_instance = None
+def build_session():
+    """Create a requests.Session with SA cookies and browser-like headers."""
+    s = requests.Session()
 
-async def create_browser_context():
-    """Launch stealth Playwright browser with SA cookies injected."""
-    global _pw_instance, _browser_instance
-    from playwright.async_api import async_playwright
+    # Set cookies
+    for name, value in SA_COOKIES.items():
+        if value:
+            s.cookies.set(name, value, domain=".seekingalpha.com")
 
-    try:
-        from playwright_stealth import Stealth
-        stealth = Stealth()
-        # use_async wraps async_playwright() — must be used as context manager
-        _pw_instance = stealth.use_async(async_playwright())
-        pw = await _pw_instance.__aenter__()
-        log.info("  Stealth mode: playwright_stealth active")
-    except Exception as e:
-        log.warning(f"  Stealth import failed ({e}), using manual evasions")
-        _pw_instance = async_playwright()
-        pw = await _pw_instance.__aenter__()
-
-    browser = await pw.chromium.launch(
-        headless=True,
-        args=[
-            "--disable-blink-features=AutomationControlled",
-            "--no-sandbox",
-            "--disable-dev-shm-usage",
-            "--disable-gpu",
-        ],
-    )
-    _browser_instance = browser
-
-    context = await browser.new_context(
-        viewport={"width": 1920, "height": 1080},
-        user_agent=(
+    # Browser-like headers — critical for bypassing bot detection
+    s.headers.update({
+        "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/131.0.0.0 Safari/537.36"
         ),
-        locale="en-US",
-        timezone_id="America/New_York",
-    )
+        "Accept": "application/json",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Referer": "https://seekingalpha.com/",
+        "Origin": "https://seekingalpha.com",
+        "DNT": "1",
+        "Connection": "keep-alive",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-CH-UA": '"Chromium";v="131", "Not_A Brand";v="24"',
+        "Sec-CH-UA-Mobile": "?0",
+        "Sec-CH-UA-Platform": '"Windows"',
+    })
 
-    # Extra manual evasions on top of stealth plugin
-    await context.add_init_script("""
-        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-        if (!window.chrome) { window.chrome = { runtime: {} }; }
-        Object.defineProperty(navigator, 'plugins', {
-            get: () => [1, 2, 3, 4, 5]
-        });
-        Object.defineProperty(navigator, 'languages', {
-            get: () => ['en-US', 'en']
-        });
-        const originalQuery = window.navigator.permissions.query;
-        window.navigator.permissions.query = (parameters) =>
-            parameters.name === 'notifications'
-                ? Promise.resolve({ state: Notification.permission })
-                : originalQuery(parameters);
-    """)
-
-    # Inject SA cookies
-    cookies_to_add = []
-    for name, value in SA_COOKIES.items():
-        if value:
-            cookies_to_add.append({
-                "name": name,
-                "value": value,
-                "domain": ".seekingalpha.com",
-                "path": "/",
-                "httpOnly": False,
-                "secure": True,
-                "sameSite": "Lax",
-            })
-
-    if cookies_to_add:
-        await context.add_cookies(cookies_to_add)
-        log.info(f"  Injected {len(cookies_to_add)} SA cookies")
-    else:
-        log.warning("  No SA cookies — will only get preview content")
-
-    return _pw_instance, browser, context
-
-
-async def cleanup_browser(pw_ref, browser):
-    """Clean up browser and playwright."""
-    try:
-        await browser.close()
-    except Exception:
-        pass
-    try:
-        await pw_ref.__aexit__(None, None, None)
-    except Exception:
-        pass
-
-
-async def human_delay(min_s=2, max_s=5):
-    await asyncio.sleep(random.uniform(min_s, max_s))
-
-
-async def scroll_page(page):
-    for _ in range(random.randint(2, 4)):
-        await page.evaluate("window.scrollBy(0, window.innerHeight * 0.6)")
-        await asyncio.sleep(random.uniform(0.5, 1.5))
+    cookie_count = sum(1 for v in SA_COOKIES.values() if v)
+    log.info(f"  Session: {cookie_count} cookies loaded")
+    return s
 
 
 # ---------------------------------------------------------------------------
-# SCRAPE SA — TRANSCRIPT LISTING
+# SEEKING ALPHA JSON API — TRANSCRIPT LISTING
 # ---------------------------------------------------------------------------
 
-async def get_transcript_links(context, ticker, sa_slug):
-    """Get recent transcript links for a ticker from SA."""
-    url = f"https://seekingalpha.com/symbol/{sa_slug}/earnings/transcripts"
-    log.info(f"  Listing: {url}")
-
-    page = await context.new_page()
-    try:
-        await human_delay(1, 3)
-        resp = await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-
-        if not resp or resp.status != 200:
-            log.warning(f"  HTTP {resp.status if resp else 'None'} for {sa_slug}")
-            return []
-
-        await asyncio.sleep(3)
-        await scroll_page(page)
-
-        html = await page.content()
-        soup = BeautifulSoup(html, "html.parser")
-
-        results = []
-        for link in soup.find_all("a", href=True):
-            href = link.get("href", "")
-            text = link.get_text(strip=True)
-
-            if "earnings-call-transcript" in href.lower() and text and len(text) > 20:
-                full_url = href if href.startswith("http") else f"https://seekingalpha.com{href}"
-                full_url = full_url.split("?")[0]
-
-                if full_url not in [r["url"] for r in results]:
-                    results.append({"title": text, "url": full_url, "ticker": ticker})
-
-        log.info(f"  Found {len(results)} transcript links")
-        return results[:3]
-
-    except Exception as e:
-        log.warning(f"  Error listing {sa_slug}: {e}")
-        return []
-    finally:
-        await page.close()
-
-
-# ---------------------------------------------------------------------------
-# SCRAPE SA — FULL TRANSCRIPT CONTENT
-# ---------------------------------------------------------------------------
-
-async def get_transcript_content(context, url, title):
-    """Fetch full transcript from a SA article page."""
-    fetch_url = url + "?part=single" if "?" not in url else url
-    log.info(f"  Fetching: {fetch_url[:80]}...")
-
-    page = await context.new_page()
-    try:
-        await human_delay(3, 7)
-        await page.set_extra_http_headers({"Referer": "https://www.google.com/"})
-        resp = await page.goto(fetch_url, wait_until="domcontentloaded", timeout=45000)
-
-        if not resp or resp.status != 200:
-            log.warning(f"  HTTP {resp.status if resp else 'None'}")
-            return None, False
-
-        await asyncio.sleep(4)
-        await scroll_page(page)
-
-        html = await page.content()
-        is_paywalled = "paywall" in html.lower() and "subscribe" in html.lower()
-        soup = BeautifulSoup(html, "html.parser")
-
-        # Try multiple selectors
-        body = None
-        for sel in [
-            {"data-test-id": "article-body"},
-            {"class": re.compile(r"paywall-full-content")},
-            {"id": "a-body"},
-            {"class": re.compile(r"article-body")},
-        ]:
-            body = soup.find("div", sel)
-            if body:
-                break
-        if not body:
-            body = soup.find("article")
-
-        if body:
-            for tag in body.find_all(["script", "style", "iframe", "noscript", "svg", "button"]):
-                tag.decompose()
-            text = body.get_text(separator="\n", strip=True)
-            if len(text) > 1000:
-                log.info(f"  ✓ {len(text):,} chars (paywalled: {is_paywalled})")
-                return text, is_paywalled
-
-        # Fallback
-        paras = soup.find_all("p")
-        text = "\n".join(p.get_text(strip=True) for p in paras if len(p.get_text(strip=True)) > 40)
-        if len(text) > 500:
-            log.info(f"  ✓ {len(text):,} chars (fallback, paywalled: {is_paywalled})")
-            return text, is_paywalled
-
-        log.warning(f"  ✗ Insufficient content ({len(text)} chars)")
-        return None, is_paywalled
-
-    except Exception as e:
-        log.warning(f"  Error fetching transcript: {e}")
-        return None, False
-    finally:
-        await page.close()
-
-
-# ---------------------------------------------------------------------------
-# MAIN SCRAPING FLOW
-# ---------------------------------------------------------------------------
-
-async def scrape_all_transcripts(tickers_to_scan):
-    log.info("Starting browser...")
-    pw, browser, context = await create_browser_context()
+def get_transcript_links(session, ticker):
+    """
+    Fetch transcript listing for a ticker via multiple SA API strategies.
+    """
+    sa_slug = TICKER_INFO.get(ticker, {}).get("sa_slug", ticker.lower())
     transcripts = []
 
+    # Strategy 1: JSON API — analysis articles filtered to transcripts
+    api_url = f"https://seekingalpha.com/api/v3/symbols/{sa_slug}/analysis"
+    params = {
+        "filter[category]": "earnings::earnings-call-transcripts",
+        "filter[since]": "0",
+        "filter[until]": "0",
+        "include": "author,primaryTickers,secondaryTickers",
+        "page[size]": "20",
+        "page[number]": "1",
+    }
+
     try:
-        for ticker, info in tickers_to_scan.items():
-            log.info(f"\n--- {ticker} ({info['name']}) ---")
+        time.sleep(random.uniform(1, 3))
+        resp = session.get(api_url, params=params, timeout=30)
+        log.info(f"    API v3 analysis: HTTP {resp.status_code}")
 
-            links = await get_transcript_links(context, ticker, info["sa_slug"])
-            if not links:
-                continue
+        if resp.status_code == 200:
+            data = resp.json()
+            for article in data.get("data", []):
+                attrs = article.get("attributes", {})
+                title = attrs.get("title", "")
+                pub_date_str = attrs.get("publishOn", "")
 
-            for link in links[:1]:
-                content, paywalled = await get_transcript_content(
-                    context, link["url"], link["title"]
-                )
-                if content and len(content) > 1000:
+                if "transcript" not in title.lower():
+                    continue
+
+                try:
+                    if pub_date_str:
+                        pub_date = datetime.fromisoformat(
+                            pub_date_str.replace("Z", "+00:00")
+                        )
+                        if pub_date < CUTOFF:
+                            continue
+                except (ValueError, TypeError):
+                    pass
+
+                article_id = article.get("id", "")
+                slug = attrs.get("slug", "")
+                if article_id:
                     transcripts.append({
-                        "ticker": ticker,
-                        "name": info["name"],
-                        "title": link["title"],
-                        "url": link["url"],
-                        "content": content,
-                        "content_length": len(content),
-                        "paywalled": paywalled,
+                        "id": article_id,
+                        "title": title,
+                        "url": f"https://seekingalpha.com/article/{article_id}-{slug}",
+                        "date": pub_date_str,
                     })
-                    break
-    finally:
-        await cleanup_browser(pw, browser)
+
+            if transcripts:
+                log.info(f"    Found {len(transcripts)} via API v3 analysis")
+                return transcripts
+    except Exception as e:
+        log.warning(f"    API v3 analysis error: {e}")
+
+    # Strategy 2: dedicated /transcripts endpoint
+    t_url = f"https://seekingalpha.com/api/v3/symbols/{sa_slug}/transcripts"
+    params2 = {
+        "include": "author,primaryTickers,secondaryTickers",
+        "page[size]": "10",
+        "page[number]": "1",
+    }
+
+    try:
+        time.sleep(random.uniform(1, 3))
+        resp = session.get(t_url, params=params2, timeout=30)
+        log.info(f"    API v3 transcripts: HTTP {resp.status_code}")
+
+        if resp.status_code == 200:
+            data = resp.json()
+            for article in data.get("data", []):
+                attrs = article.get("attributes", {})
+                title = attrs.get("title", "")
+                pub_date_str = attrs.get("publishOn", "")
+
+                try:
+                    if pub_date_str:
+                        pub_date = datetime.fromisoformat(
+                            pub_date_str.replace("Z", "+00:00")
+                        )
+                        if pub_date < CUTOFF:
+                            continue
+                except (ValueError, TypeError):
+                    pass
+
+                article_id = article.get("id", "")
+                slug = attrs.get("slug", "")
+                if article_id:
+                    transcripts.append({
+                        "id": article_id,
+                        "title": title,
+                        "url": f"https://seekingalpha.com/article/{article_id}-{slug}",
+                        "date": pub_date_str,
+                    })
+
+            if transcripts:
+                log.info(f"    Found {len(transcripts)} via transcripts endpoint")
+                return transcripts
+    except Exception as e:
+        log.warning(f"    API v3 transcripts error: {e}")
+
+    # Strategy 3: HTML scrape of transcripts listing
+    html_url = (
+        f"https://seekingalpha.com/symbol/{sa_slug.upper()}/earnings/transcripts"
+    )
+    try:
+        time.sleep(random.uniform(2, 4))
+        resp = session.get(
+            html_url,
+            headers={"Accept": "text/html,application/xhtml+xml"},
+            timeout=30,
+        )
+        log.info(f"    HTML listing: HTTP {resp.status_code}")
+
+        if resp.status_code == 200:
+            soup = BeautifulSoup(resp.text, "lxml")
+            for link in soup.find_all("a", href=True):
+                href = link["href"]
+                if "earnings-call-transcript" in href:
+                    title = link.get_text(strip=True)
+                    if not title:
+                        continue
+                    full_url = (
+                        href
+                        if href.startswith("http")
+                        else f"https://seekingalpha.com{href}"
+                    )
+                    id_match = re.search(r"/article/(\d+)", full_url)
+                    article_id = id_match.group(1) if id_match else ""
+                    transcripts.append({
+                        "id": article_id,
+                        "title": title,
+                        "url": full_url,
+                        "date": "",
+                    })
+
+            if transcripts:
+                transcripts = transcripts[:3]
+                log.info(f"    Found {len(transcripts)} via HTML scrape")
+                return transcripts
+    except Exception as e:
+        log.warning(f"    HTML scrape error: {e}")
+
+    # Strategy 4: __NEXT_DATA__ from the HTML page
+    try:
+        if resp and resp.status_code == 200:
+            match = re.search(
+                r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>',
+                resp.text,
+                re.DOTALL,
+            )
+            if match:
+                nd = json.loads(match.group(1))
+                # Try common paths in SA's Next.js structure
+                articles = []
+                try:
+                    articles = (
+                        nd.get("props", {})
+                        .get("pageProps", {})
+                        .get("articles", {})
+                        .get("data", [])
+                    )
+                except (AttributeError, TypeError):
+                    pass
+
+                for article in articles:
+                    attrs = article.get("attributes", {})
+                    title = attrs.get("title", "")
+                    article_id = article.get("id", "")
+                    slug = attrs.get("slug", "")
+                    if article_id and "transcript" in title.lower():
+                        transcripts.append({
+                            "id": article_id,
+                            "title": title,
+                            "url": f"https://seekingalpha.com/article/{article_id}-{slug}",
+                            "date": attrs.get("publishOn", ""),
+                        })
+
+                if transcripts:
+                    log.info(f"    Found {len(transcripts)} via __NEXT_DATA__")
+                    return transcripts
+    except Exception as e:
+        log.warning(f"    __NEXT_DATA__ listing error: {e}")
 
     return transcripts
 
 
 # ---------------------------------------------------------------------------
-# CLAUDE API ANALYSIS
+# SEEKING ALPHA JSON API — TRANSCRIPT CONTENT
 # ---------------------------------------------------------------------------
 
-AUB_PROMPT = """You are an equity research analyst covering AUB Group (ASX: AUB),
-an Australian insurance broker network. You are reviewing a peer company's earnings
-call transcript to identify early warning signals for AUB.
+def get_transcript_content(session, transcript_info):
+    """
+    Fetch full transcript content via JSON API or HTML fallback.
+    """
+    article_id = transcript_info.get("id", "")
+    url = transcript_info.get("url", "")
+    title = transcript_info.get("title", "")
+
+    # Strategy 1: JSON API for article body
+    if article_id:
+        content_url = f"https://seekingalpha.com/api/v3/articles/{article_id}"
+        params = {
+            "include": "author,primaryTickers,secondaryTickers,otherTags",
+        }
+        try:
+            time.sleep(random.uniform(2, 5))
+            resp = session.get(content_url, params=params, timeout=30)
+            log.info(f"    Article API: HTTP {resp.status_code}")
+
+            if resp.status_code == 200:
+                data = resp.json()
+                attrs = data.get("data", {}).get("attributes", {})
+                body_html = attrs.get("content", "") or attrs.get("body", "")
+
+                if body_html:
+                    soup = BeautifulSoup(body_html, "lxml")
+                    text = soup.get_text(separator="\n", strip=True)
+                    if len(text) > 500:
+                        log.info(f"    Got {len(text)} chars via article API")
+                        return text
+        except Exception as e:
+            log.warning(f"    Article API error: {e}")
+
+    # Strategy 2: HTML page with ?part=single
+    if url:
+        fetch_url = url
+        if "?part=single" not in fetch_url:
+            fetch_url += "?part=single"
+
+        try:
+            time.sleep(random.uniform(3, 6))
+            resp = session.get(
+                fetch_url,
+                headers={"Accept": "text/html,application/xhtml+xml"},
+                timeout=30,
+            )
+            log.info(f"    HTML article: HTTP {resp.status_code}")
+
+            if resp.status_code == 200:
+                soup = BeautifulSoup(resp.text, "lxml")
+
+                body = None
+                for selector in [
+                    {"data-test-id": "article-body"},
+                    {"class_": "paywall-full-content"},
+                    {"id": "a-body"},
+                    {"class_": "article-body"},
+                ]:
+                    body = soup.find("div", selector)
+                    if body:
+                        break
+
+                if body:
+                    text = body.get_text(separator="\n", strip=True)
+                else:
+                    paragraphs = [
+                        p.get_text(strip=True)
+                        for p in soup.find_all("p")
+                        if len(p.get_text(strip=True)) > 40
+                    ]
+                    text = "\n".join(paragraphs)
+
+                if len(text) > 500:
+                    log.info(f"    Got {len(text)} chars via HTML page")
+                    return text
+
+                # Try __NEXT_DATA__ embedded in the article page
+                match = re.search(
+                    r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>',
+                    resp.text,
+                    re.DOTALL,
+                )
+                if match:
+                    try:
+                        nd = json.loads(match.group(1))
+                        props = nd.get("props", {}).get("pageProps", {})
+                        article = props.get("article", {}) or props.get("data", {})
+                        body_html = (
+                            article.get("attributes", {}).get("content", "")
+                            or article.get("body", "")
+                        )
+                        if body_html:
+                            soup2 = BeautifulSoup(body_html, "lxml")
+                            text = soup2.get_text(separator="\n", strip=True)
+                            if len(text) > 500:
+                                log.info(f"    Got {len(text)} chars via __NEXT_DATA__")
+                                return text
+                    except (json.JSONDecodeError, AttributeError):
+                        pass
+        except Exception as e:
+            log.warning(f"    HTML fetch error: {e}")
+
+    log.warning(f"    No content retrieved for: {title}")
+    return None
+
+
+# ---------------------------------------------------------------------------
+# MAIN SCRAPING LOOP
+# ---------------------------------------------------------------------------
+
+def scrape_all_transcripts():
+    """Scrape transcripts for all configured tickers."""
+    session = build_session()
+    all_transcripts = []
+
+    for ticker in TICKERS:
+        info = TICKER_INFO.get(ticker, {"name": ticker, "sa_slug": ticker.lower()})
+        print(f"\n--- {ticker} ({info['name']}) ---")
+
+        links = get_transcript_links(session, ticker)
+
+        if not links:
+            log.warning(f"    No transcripts found for {ticker}")
+            continue
+
+        latest = links[0]
+        log.info(f"    Latest: {latest['title']}")
+
+        content = get_transcript_content(session, latest)
+
+        if content:
+            all_transcripts.append({
+                "ticker": ticker,
+                "company": info["name"],
+                "title": latest["title"],
+                "url": latest.get("url", ""),
+                "date": latest.get("date", ""),
+                "content": content,
+                "content_length": len(content),
+            })
+            log.info(f"    OK {ticker}: {len(content)} chars")
+        else:
+            log.warning(f"    FAIL {ticker}: no content")
+
+        time.sleep(random.uniform(2, 5))
+
+    return all_transcripts
+
+
+# ---------------------------------------------------------------------------
+# CLAUDE ANALYSIS
+# ---------------------------------------------------------------------------
+
+CLAUDE_PROMPT = """You are an expert insurance industry analyst. Analyse this earnings call transcript
+for read-throughs relevant to AUB Group (ASX: AUB), Australia's largest insurance broker network.
 
 AUB CONTEXT:
-{focus_description}
-
-PEER: {peer_name} ({peer_ticker})
-TRANSCRIPT: {title}
-
-Produce a CONCISE summary (max 400 words):
-
-**{peer_ticker} — {title}**
-
-HEADLINE: One sentence on the most important read-through for AUB.
-
-KEY SIGNALS FOR AUB:
-🟢 Positive (2-4 bullets of good news for AUB)
-🔴 Negative (2-4 bullets of bad news / risks for AUB)
-
-SPECIFIC DATA POINTS:
-- Premium rate changes by line (property, casualty, specialty)
-- Organic growth rates, especially APAC/Australia
-- M&A activity, multiples, pipeline
-- Margin trends
-- Any mentions of Australia, APAC, competitors
-
-BOTTOM LINE: 2-3 sentences on what this means for AUB.
-
-Be specific with numbers. Only include what's in the transcript.
+- Property insurance: ~45-50% of GWP (Business Packages, ISR, Strata, Farm)
+- Casualty insurance: ~27% of GWP (Liability, Workers' Comp, Motor, PI)
+- Panel composition: CGU/IAG 43%, Lloyd's 16%, Allianz 12%, QBE 8%
+- Key themes: broker consolidation, premium rate cycle, claims inflation, APAC expansion
 
 TRANSCRIPT:
-{transcript_text}
-"""
+{transcript}
+
+Provide your analysis in this format:
+
+HEADLINE: [One sentence - the single most important read-through for AUB]
+
+Positive signals (2-4 bullets)
+Negative signals (2-4 bullets)
+
+SPECIFIC DATA: [Extract any specific numbers on: premium rates by line, organic growth
+(especially APAC/international), M&A activity/multiples paid, margins, loss ratios]
+
+BOTTOM LINE: [2-3 sentences on what this means for AUB specifically]
+
+Keep it under 400 words. Be specific, not generic."""
 
 
-def analyse_with_claude(transcript):
+def analyse_with_claude(transcript_text):
+    """Send transcript to Claude for AUB-focused analysis."""
     if not ANTHROPIC_API_KEY:
-        return keyword_fallback(transcript)
-
-    text = transcript["content"][:150000]
-    prompt = AUB_PROMPT.format(
-        focus_description=FOCUS_DESCRIPTION,
-        peer_name=transcript["name"],
-        peer_ticker=transcript["ticker"],
-        title=transcript["title"],
-        transcript_text=text,
-    )
+        return keyword_fallback(transcript_text)
 
     try:
         resp = requests.post(
@@ -391,200 +502,158 @@ def analyse_with_claude(transcript):
             },
             json={
                 "model": "claude-sonnet-4-20250514",
-                "max_tokens": 1500,
-                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 1000,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": CLAUDE_PROMPT.format(
+                            transcript=transcript_text[:80000]
+                        ),
+                    }
+                ],
             },
             timeout=120,
         )
+
         if resp.status_code == 200:
-            return resp.json()["content"][0]["text"]
+            data = resp.json()
+            parts = [
+                b["text"] for b in data.get("content", []) if b.get("type") == "text"
+            ]
+            return "\n".join(parts)
         else:
-            log.warning(f"  Claude error: {resp.status_code}")
-            return keyword_fallback(transcript)
+            log.warning(f"  Claude API: HTTP {resp.status_code} — {resp.text[:200]}")
+            return keyword_fallback(transcript_text)
     except Exception as e:
-        log.warning(f"  Claude exception: {e}")
-        return keyword_fallback(transcript)
+        log.warning(f"  Claude API error: {e}")
+        return keyword_fallback(transcript_text)
 
 
-def keyword_fallback(transcript):
-    text = transcript["content"].lower()
-    kw = {
-        "Property rates": ["property rate", "property premium", "property pricing"],
-        "Casualty rates": ["casualty rate", "casualty premium", "casualty pricing"],
-        "Organic growth": ["organic growth", "organic revenue"],
-        "M&A": ["acquisition", "acquired", "term sheet", "pipeline"],
-        "Margins": ["margin expansion", "margin compression", "ebitda margin"],
-        "APAC": ["australia", "apac", "asia pacific", "pacific"],
-        "Reinsurance": ["reinsurance", "reinsurer", "property cat"],
+def keyword_fallback(text):
+    """Simple keyword extraction when Claude is unavailable."""
+    keywords = {
+        "property": ["property", "property insurance", "ISR", "strata"],
+        "casualty": ["casualty", "liability", "workers comp", "motor"],
+        "rates": ["rate increase", "premium rate", "rate hardening", "pricing"],
+        "M&A": ["acquisition", "acquire", "merger", "bolt-on", "multiple"],
+        "APAC": ["asia", "pacific", "australia", "apac", "international"],
+        "margins": ["margin", "operating ratio", "expense ratio", "combined ratio"],
     }
-    findings = []
-    for cat, terms in kw.items():
-        count = sum(text.count(t) for t in terms)
-        if count > 0:
-            for t in terms:
-                idx = text.find(t)
-                if idx != -1:
-                    s = max(0, idx - 80)
-                    e = min(len(text), idx + len(t) + 150)
-                    snippet = re.sub(r"\s+", " ", transcript["content"][s:e].strip())
-                    findings.append(f"**{cat}** ({count}x): ...{snippet}...")
-                    break
 
-    header = f"**{transcript['ticker']} — {transcript['title']}**\n"
-    header += "(Keyword fallback — set ANTHROPIC_API_KEY for AI summary)\n\n"
-    return header + "\n".join(findings) if findings else header + "No key terms found."
+    text_lower = text.lower()
+    lines = []
+    for category, terms in keywords.items():
+        found = [t for t in terms if t.lower() in text_lower]
+        if found:
+            lines.append(f"**{category}**: mentions of {', '.join(found)}")
+
+    if lines:
+        return "KEYWORD ANALYSIS (Claude unavailable):\n" + "\n".join(lines)
+    return "No relevant keywords found (Claude unavailable)."
 
 
 # ---------------------------------------------------------------------------
 # EMAIL
 # ---------------------------------------------------------------------------
 
-def send_email(subject, html_body, text_body=None):
+def send_email(transcripts, analyses):
+    """Send results via Gmail."""
     if not SMTP_USER or not SMTP_PASSWORD:
-        log.error("SMTP not configured")
-        print(f"\nSUBJECT: {subject}\n{'='*60}\n{text_body or html_body}")
-        return False
+        log.warning("No SMTP credentials — skipping email")
+        return
+
+    today = datetime.now().strftime("%d %b %Y")
+    ticker_str = ", ".join(TICKERS)
+
+    subject = f"AUB Peer Monitor — {ticker_str} — {today}"
+
+    html_parts = [
+        '<div style="font-family: -apple-system, BlinkMacSystemFont, sans-serif; max-width: 700px; margin: 0 auto;">',
+        f'<div style="background: #1a365d; color: white; padding: 20px; border-radius: 8px 8px 0 0;">',
+        f'<h2 style="margin: 0;">AUB Peer Earnings Monitor</h2>',
+        f'<p style="margin: 5px 0 0; opacity: 0.8;">{today} | {len(transcripts)} transcript(s)</p>',
+        "</div>",
+    ]
+
+    if not transcripts:
+        html_parts.append(
+            '<div style="padding: 20px; background: #fff3cd; border: 1px solid #ffc107; margin: 10px 0; border-radius: 4px;">'
+            f"<p>No new transcripts found in the last {LOOKBACK_DAYS} days for: {ticker_str}</p>"
+            "</div>"
+        )
+    else:
+        for i, t in enumerate(transcripts):
+            analysis = analyses[i] if i < len(analyses) else "Analysis unavailable"
+            html_parts.append(
+                f'<div style="border: 1px solid #e2e8f0; border-radius: 8px; margin: 15px 0; overflow: hidden;">'
+                f'<div style="background: #f7fafc; padding: 12px 16px; border-bottom: 1px solid #e2e8f0;">'
+                f'<strong>{t["ticker"]}</strong> — {t["company"]}<br>'
+                f'<a href="{t["url"]}" style="color: #2b6cb0;">{t["title"]}</a>'
+                f'<br><span style="color: #718096; font-size: 12px;">{t.get("date", "")} | {t["content_length"]:,} chars</span>'
+                f"</div>"
+                f'<div style="padding: 16px; font-size: 14px; line-height: 1.6; white-space: pre-wrap;">{analysis}</div>'
+                f"</div>"
+            )
+
+    html_parts.append("</div>")
+    html_body = "\n".join(html_parts)
+
+    plain_parts = [f"AUB Peer Earnings Monitor — {today}\n{'=' * 50}\n"]
+    if not transcripts:
+        plain_parts.append(f"No new transcripts found (last {LOOKBACK_DAYS} days)\n")
+    else:
+        for i, t in enumerate(transcripts):
+            analysis = analyses[i] if i < len(analyses) else "Analysis unavailable"
+            plain_parts.append(
+                f"\n--- {t['ticker']} ({t['company']}) ---\n"
+                f"{t['title']}\n{t['url']}\n\n"
+                f"{analysis}\n"
+            )
 
     msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
     msg["From"] = SMTP_USER
     msg["To"] = EMAIL_TO
-    msg["Subject"] = subject
-    if text_body:
-        msg.attach(MIMEText(text_body, "plain"))
+    msg.attach(MIMEText("\n".join(plain_parts), "plain"))
     msg.attach(MIMEText(html_body, "html"))
 
     try:
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+        with smtplib.SMTP("smtp.gmail.com", 587) as server:
             server.starttls()
             server.login(SMTP_USER, SMTP_PASSWORD)
-            server.sendmail(SMTP_USER, EMAIL_TO.split(","), msg.as_string())
-        log.info(f"✓ Email sent to {EMAIL_TO}")
-        return True
+            server.sendmail(SMTP_USER, EMAIL_TO, msg.as_string())
+        log.info(f"Email sent to {EMAIL_TO}")
     except Exception as e:
-        log.error(f"✗ Email failed: {e}")
-        return False
-
-
-def build_email(analyses, transcripts_found, total_peers):
-    now = datetime.now(timezone.utc).strftime("%d %b %Y %H:%M UTC")
-
-    text_parts = [
-        "AUB PEER EARNINGS MONITOR",
-        f"Generated: {now}",
-        f"Transcripts: {transcripts_found}/{total_peers} peers",
-        "=" * 60,
-    ]
-    for a in analyses:
-        text_parts += ["", a, "", "-" * 60]
-    if not analyses:
-        text_parts += ["", "No new peer transcripts found."]
-    text_body = "\n".join(text_parts)
-
-    html_sections = ""
-    for a in analyses:
-        f = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", a)
-        f = re.sub(r"🟢", '<span style="color:#16a34a">🟢</span>', f)
-        f = re.sub(r"🔴", '<span style="color:#dc2626">🔴</span>', f)
-        f = f.replace("\n", "<br>")
-        html_sections += f"""
-        <div style="background:#f9fafb; border-left:4px solid #2563eb; padding:16px;
-                     margin:16px 0; border-radius:4px; font-size:14px; line-height:1.7;">
-            {f}
-        </div>"""
-
-    if not analyses:
-        html_sections = f"""
-        <div style="background:#fef9c3; border-left:4px solid #eab308; padding:16px;
-                     margin:16px 0; border-radius:4px;">
-            No new peer transcripts found in the last {LOOKBACK_DAYS} days.
-        </div>"""
-
-    html_body = f"""<html><body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
-        max-width:700px; margin:0 auto; color:#1a1a1a;">
-        <div style="background:#1e3a5f; color:white; padding:20px; border-radius:8px 8px 0 0;">
-            <h2 style="margin:0; font-size:20px;">📊 AUB Peer Earnings Monitor</h2>
-            <p style="margin:8px 0 0; opacity:0.8; font-size:13px;">
-                {now} · {transcripts_found}/{total_peers} peers · Lookback: {LOOKBACK_DAYS}d</p>
-        </div>
-        <div style="padding:16px;">
-            {html_sections}
-            <div style="margin-top:24px; padding-top:16px; border-top:1px solid #e5e7eb;
-                         font-size:12px; color:#6b7280;">
-                Peers: {', '.join(PEERS.keys())} · Source: Seeking Alpha
-            </div>
-        </div></body></html>"""
-
-    return html_body, text_body
+        log.error(f"Email failed: {e}")
 
 
 # ---------------------------------------------------------------------------
 # MAIN
 # ---------------------------------------------------------------------------
 
-async def async_main():
+def main():
     log.info("=" * 60)
-    log.info("AUB PEER EARNINGS MONITOR — Seeking Alpha")
-    log.info(f"Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
+    log.info("AUB PEER EARNINGS MONITOR — Seeking Alpha (JSON API)")
+    log.info(f"Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC")
     log.info("=" * 60)
-
-    if TICKERS_ENV:
-        tickers_to_scan = {}
-        for t in TICKERS_ENV.split(","):
-            t = t.strip()
-            if t in PEERS:
-                tickers_to_scan[t] = PEERS[t]
-            else:
-                tickers_to_scan[t] = {"name": t, "sa_slug": t}
-    else:
-        tickers_to_scan = PEERS.copy()
-
-    log.info(f"Peers: {', '.join(tickers_to_scan.keys())}")
-    log.info(f"Email: {SMTP_USER or '(none)'} → {EMAIL_TO}")
+    log.info(f"Peers: {', '.join(TICKERS)}")
+    log.info(f"Email: {SMTP_USER} -> {EMAIL_TO}")
     log.info(f"Claude API: {'yes' if ANTHROPIC_API_KEY else 'no'}")
-    log.info(f"SA cookies: {sum(1 for v in SA_COOKIES.values() if v)}/6")
 
-    if "--dry-run" in sys.argv:
-        log.info("\nDRY RUN — test email")
-        test = (
-            "**AJG — Arthur J. Gallagher Q4 2025 Earnings Call**\n\n"
-            "HEADLINE: Property reinsurance rates down in the teens globally.\n\n"
-            "🟢 Positive:\n• Casualty rates stable (+5-7% US)\n"
-            "• Strong retention\n• Risk mgmt organic +7%\n\n"
-            "🔴 Negative:\n• Property cat rates down in teens\n"
-            "• APAC weakest at +3%\n• $10bn M&A firepower\n\n"
-            "BOTTOM LINE: Property softening hits ~45% of AUB's book. "
-            "Casualty firmness provides partial offset."
-        )
-        html, text = build_email([test], 1, len(tickers_to_scan))
-        send_email(f"[TEST] AUB Peer Monitor — {datetime.now().strftime('%d %b %Y')}", html, text)
-        return
+    cookie_count = sum(1 for v in SA_COOKIES.values() if v)
+    log.info(f"SA cookies: {cookie_count}/{len(SA_COOKIES)}")
 
-    transcripts = await scrape_all_transcripts(tickers_to_scan)
-    log.info(f"\nRESULTS: {len(transcripts)} transcripts")
+    transcripts = scrape_all_transcripts()
 
-    if not transcripts:
-        html, text = build_email([], 0, len(tickers_to_scan))
-        send_email(f"AUB Peer Monitor — No transcripts — {datetime.now().strftime('%d %b')}", html, text)
-        return
+    print(f"\nRESULTS: {len(transcripts)} transcripts")
 
     analyses = []
     for t in transcripts:
-        log.info(f"\nAnalysing {t['ticker']} ({t['content_length']:,} chars)...")
-        a = analyse_with_claude(t)
-        if a:
-            analyses.append(a)
-            log.info(f"  ✓ Done")
+        log.info(f"  Analysing {t['ticker']}...")
+        analysis = analyse_with_claude(t["content"])
+        analyses.append(analysis)
 
-    tickers_found = list(set(t["ticker"] for t in transcripts))
-    subject = f"AUB Peer Monitor — {', '.join(tickers_found)} — {datetime.now().strftime('%d %b %Y')}"
-    html, text = build_email(analyses, len(transcripts), len(tickers_to_scan))
-    send_email(subject, html, text)
-
-    log.info("\nCOMPLETE")
-
-
-def main():
-    asyncio.run(async_main())
+    send_email(transcripts, analyses)
 
 
 if __name__ == "__main__":
