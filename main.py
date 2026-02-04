@@ -105,6 +105,25 @@ def build_session():
 
     cookie_count = sum(1 for v in SA_COOKIES.values() if v)
     log.info(f"  Session: {cookie_count} cookies loaded")
+
+    # Warm up: hit homepage to collect cf_clearance and any redirect cookies
+    try:
+        log.info("  Warming up session on SA homepage...")
+        warm = s.get(
+            "https://seekingalpha.com/",
+            headers={"Accept": "text/html,application/xhtml+xml"},
+            timeout=30,
+            allow_redirects=True,
+        )
+        log.info(f"  Homepage: HTTP {warm.status_code}, cookies now: {len(s.cookies)}")
+        # Log any new cookies we picked up (especially cf_clearance)
+        for c in s.cookies:
+            if c.name.startswith("cf_") or c.name.startswith("__cf"):
+                log.info(f"  Got Cloudflare cookie: {c.name}")
+        time.sleep(random.uniform(3, 6))
+    except Exception as e:
+        log.warning(f"  Homepage warm-up failed: {e}")
+
     return s
 
 
@@ -114,75 +133,24 @@ def build_session():
 
 def get_transcript_links(session, ticker):
     """
-    Fetch transcript listing for a ticker via multiple SA API strategies.
+    Fetch transcript listing for a ticker via SA API.
+    Uses /transcripts endpoint first (proved to work for AJG).
     """
     sa_slug = TICKER_INFO.get(ticker, {}).get("sa_slug", ticker.lower())
     transcripts = []
 
-    # Strategy 1: JSON API — analysis articles filtered to transcripts
-    api_url = f"https://seekingalpha.com/api/v3/symbols/{sa_slug}/analysis"
-    params = {
-        "filter[category]": "earnings::earnings-call-transcripts",
-        "filter[since]": "0",
-        "filter[until]": "0",
-        "include": "author,primaryTickers,secondaryTickers",
-        "page[size]": "20",
-        "page[number]": "1",
-    }
-
-    try:
-        time.sleep(random.uniform(1, 3))
-        resp = session.get(api_url, params=params, timeout=30)
-        log.info(f"    API v3 analysis: HTTP {resp.status_code}")
-
-        if resp.status_code == 200:
-            data = resp.json()
-            for article in data.get("data", []):
-                attrs = article.get("attributes", {})
-                title = attrs.get("title", "")
-                pub_date_str = attrs.get("publishOn", "")
-
-                if "transcript" not in title.lower():
-                    continue
-
-                try:
-                    if pub_date_str:
-                        pub_date = datetime.fromisoformat(
-                            pub_date_str.replace("Z", "+00:00")
-                        )
-                        if pub_date < CUTOFF:
-                            continue
-                except (ValueError, TypeError):
-                    pass
-
-                article_id = article.get("id", "")
-                slug = attrs.get("slug", "")
-                if article_id:
-                    transcripts.append({
-                        "id": article_id,
-                        "title": title,
-                        "url": f"https://seekingalpha.com/article/{article_id}-{slug}",
-                        "date": pub_date_str,
-                    })
-
-            if transcripts:
-                log.info(f"    Found {len(transcripts)} via API v3 analysis")
-                return transcripts
-    except Exception as e:
-        log.warning(f"    API v3 analysis error: {e}")
-
-    # Strategy 2: dedicated /transcripts endpoint
+    # Strategy 1: dedicated /transcripts endpoint (worked for AJG)
     t_url = f"https://seekingalpha.com/api/v3/symbols/{sa_slug}/transcripts"
-    params2 = {
+    params = {
         "include": "author,primaryTickers,secondaryTickers",
         "page[size]": "10",
         "page[number]": "1",
     }
 
     try:
-        time.sleep(random.uniform(1, 3))
-        resp = session.get(t_url, params=params2, timeout=30)
-        log.info(f"    API v3 transcripts: HTTP {resp.status_code}")
+        time.sleep(random.uniform(3, 6))
+        resp = session.get(t_url, params=params, timeout=30)
+        log.info(f"    API transcripts: HTTP {resp.status_code}")
 
         if resp.status_code == 200:
             data = resp.json()
@@ -214,8 +182,11 @@ def get_transcript_links(session, ticker):
             if transcripts:
                 log.info(f"    Found {len(transcripts)} via transcripts endpoint")
                 return transcripts
+        elif resp.status_code == 403:
+            log.warning(f"    Rate limited on transcripts endpoint, waiting...")
+            time.sleep(random.uniform(10, 20))
     except Exception as e:
-        log.warning(f"    API v3 transcripts error: {e}")
+        log.warning(f"    API transcripts error: {e}")
 
     # Strategy 3: HTML scrape of transcripts listing
     html_url = (
@@ -321,24 +292,34 @@ def get_transcript_content(session, transcript_info):
         params = {
             "include": "author,primaryTickers,secondaryTickers,otherTags",
         }
-        try:
-            time.sleep(random.uniform(2, 5))
-            resp = session.get(content_url, params=params, timeout=30)
-            log.info(f"    Article API: HTTP {resp.status_code}")
+        # Try the article API up to 2 times with backoff
+        for attempt in range(2):
+            try:
+                wait = random.uniform(4, 8) if attempt == 0 else random.uniform(15, 25)
+                time.sleep(wait)
+                resp = session.get(content_url, params=params, timeout=30)
+                log.info(f"    Article API (attempt {attempt+1}): HTTP {resp.status_code}")
 
-            if resp.status_code == 200:
-                data = resp.json()
-                attrs = data.get("data", {}).get("attributes", {})
-                body_html = attrs.get("content", "") or attrs.get("body", "")
+                if resp.status_code == 200:
+                    data = resp.json()
+                    attrs = data.get("data", {}).get("attributes", {})
+                    body_html = attrs.get("content", "") or attrs.get("body", "")
 
-                if body_html:
-                    soup = BeautifulSoup(body_html, "lxml")
-                    text = soup.get_text(separator="\n", strip=True)
-                    if len(text) > 500:
-                        log.info(f"    Got {len(text)} chars via article API")
-                        return text
-        except Exception as e:
-            log.warning(f"    Article API error: {e}")
+                    if body_html:
+                        soup = BeautifulSoup(body_html, "lxml")
+                        text = soup.get_text(separator="\n", strip=True)
+                        if len(text) > 500:
+                            log.info(f"    Got {len(text)} chars via article API")
+                            return text
+                    break  # Got 200 but no content — don't retry
+                elif resp.status_code == 403:
+                    log.warning(f"    Article API 403, backing off...")
+                    continue  # Retry with longer wait
+                else:
+                    break  # Other error, don't retry
+            except Exception as e:
+                log.warning(f"    Article API error: {e}")
+                break
 
     # Strategy 2: HTML page with ?part=single
     if url:
@@ -347,7 +328,7 @@ def get_transcript_content(session, transcript_info):
             fetch_url += "?part=single"
 
         try:
-            time.sleep(random.uniform(3, 6))
+            time.sleep(random.uniform(6, 12))
             resp = session.get(
                 fetch_url,
                 headers={"Accept": "text/html,application/xhtml+xml"},
@@ -451,7 +432,7 @@ def scrape_all_transcripts():
         else:
             log.warning(f"    FAIL {ticker}: no content")
 
-        time.sleep(random.uniform(2, 5))
+        time.sleep(random.uniform(5, 10))
 
     return all_transcripts
 
